@@ -126,6 +126,7 @@ class DiskClient:
         media_type: str | None = None,
         include_trash: bool = False,
         read_timeout: float | None = None,
+        extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Одна страница листинга папки (GET /v1/disk/resources).
 
@@ -133,6 +134,10 @@ class DiskClient:
         (тысячи фотографий) Яндекс формирует ответ заметно дольше обычных 60 с,
         и при стандартном таймауте запрос обрывается с ConnectTimeout/
         ReadTimeout. Здесь он поднимается по умолчанию до 300 с.
+
+        `extra_params` — дополнительные параметры запроса; используются
+        стратегией «alphabet-splitting» (см. inventory.split_listing_by_prefix)
+        для фильтров вида `name=glob:<папка>/<префикс>*`.
         """
         params: dict[str, Any] = {"path": path, "limit": max(1, int(limit))}
         if offset > 0:
@@ -143,6 +148,8 @@ class DiskClient:
             params["media_type"] = media_type
         if include_trash:
             params["include_trash"] = "true"
+        if extra_params:
+            params.update(extra_params)
         timeout = self.timeout
         if read_timeout is not None:
             timeout = (timeout[0], float(read_timeout))

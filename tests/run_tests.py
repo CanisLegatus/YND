@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from yandex_disk_backup.api import DiskClient  # noqa: E402
 from yandex_disk_backup.config import Config  # noqa: E402
 from yandex_disk_backup.downloader import Downloader  # noqa: E402
+from yandex_disk_backup.api import NetworkError  # noqa: E402
 from yandex_disk_backup.inventory import InventoryScanner, list_folder  # noqa: E402
 from yandex_disk_backup.manifest import Manifest, Resource  # noqa: E402
 from yandex_disk_backup.naming import PathAllocator, sanitize_component  # noqa: E402
@@ -100,6 +101,17 @@ class FakeDisk:
 
     def _listing(self, path: str, params: dict) -> dict:
         items = self.tree.get(path, [])
+        # Поддержка name=glob:<папка>/<префикс>* — фильтр по префиксу имени
+        # (стратегия alphabet-splitting). Как и Яндекс, применяем glob только
+        # к прямым детям (path не рекурсивный).
+        name_filter = params.get("name") or ""
+        if name_filter.startswith("glob:") and "*" not in name_filter[:-1]:
+            pattern = name_filter[5:]
+            prefix_dir, _, prefix_name = pattern.rpartition("/")
+            if prefix_dir.rstrip("/") == path.rstrip("/") or prefix_dir.rstrip("/") == path[5:].rstrip("/"):
+                pl = prefix_name.lower()
+                items = [i for i in items
+                         if str(i.get("name", "")).lower().startswith(pl)]
         limit = int(params.get("limit") or 100)
         offset = int(params.get("offset") or 0)
         page = items[offset:offset + limit]
@@ -282,6 +294,151 @@ def test_pagination_and_scan() -> None:
     check("папки отличины от файлов",
           len(manifest.folders) == 5 and all(d.is_dir for d in manifest.folders))
     check("запросы к API посчитаны", manifest.stats.api_requests >= 5, f"{manifest.stats.api_requests}")
+
+
+def test_alphabet_splitting() -> None:
+    section("План А: alphabet-splitting для гигантских папок")
+    from yandex_disk_backup.inventory import split_listing_by_prefix
+
+    # 1) Детерминированный fake: глоб фильтрует по префиксу, total = всего
+    #    в каталоге (как у Яндекса). Проверяем полное покрытие без дублей.
+    class SplitFake:
+        def __init__(self, items: list[dict]) -> None:
+            self.items = items
+            self.requests = 0
+            self.glob_requests = 0
+
+        def session(self):
+            outer = self
+
+            class _S:
+                def request(self, method, url, params=None, headers=None, timeout=None,
+                            allow_redirects=None):
+                    outer.requests += 1
+                    name = (params or {}).get("name") or ""
+                    if name.startswith("glob:"):
+                        outer.glob_requests += 1
+                        prefix = name[5:].rpartition("/")[2].rstrip("*")
+                        pl = prefix.lower()
+                        # как Яндекс: глоб '<префикс>*' матчит имя по префиксу
+                        page = [i for i in outer.items
+                                if str(i["name"]).lower().startswith(pl)]
+                    else:
+                        page = list(outer.items)
+                    limit = int((params or {}).get("limit") or 100)
+                    offset = int((params or {}).get("offset") or 0)
+                    return FakeResponse(200, {
+                        "path": "/Big", "type": "dir", "name": "Big",
+                        "_embedded": {"items": page[offset:offset + limit],
+                                      "total": len(outer.items),
+                                      "limit": limit, "offset": offset},
+                    })
+            return _S()
+
+    big = [{"name": f"IMG_{i:0565d}.jpg", "path": f"/Big/IMG_{i:0565d}.jpg",
+            "type": "file", "size": 10} for i in range(300)]
+    fake = SplitFake(big)
+    client = DiskClient("token-abcdefghijklmnop", session=fake.session(), min_request_interval=0)
+
+    folder, items, total = split_listing_by_prefix(client, "disk:/Big", page_size=50)
+    paths = [r.api_path for r in items]
+    check("сплит собрал все элементы", len(items) == 300, f"{len(items)}")
+    check("нет дублей", len(set(paths)) == len(paths))
+    check("папка-ресурс распознана", folder.type == "dir" and folder.api_path == "disk:/Big")
+    check("использованы фильтры по префиксу", fake.glob_requests > 1, f"{fake.glob_requests}")
+
+    # 2) Сканер с низким порогом: гигантская папка обходится сплитом, манифест полный.
+    tree: dict[str, list[dict]] = {
+        "disk:/": [_resource("Big", "/Big", type_="dir")],
+        "disk:/Big": big,
+    }
+    fake2 = FakeDisk(tree)
+    client2 = DiskClient("token-abcdefghijklmnop", session=fake2.session(), min_request_interval=0)
+    scanner = InventoryScanner(client2, root="disk:/", page_size=50, split_threshold=100)
+    manifest = scanner.scan()
+    check("обход с делением завершён полностью", manifest.is_complete(), str(manifest.errors))
+    check("все файлы гигантской папки в манифесте", manifest.stats.files == 300,
+          f"{manifest.stats.files}")
+    check("папок ровно две", manifest.stats.folders == 2, f"{manifest.stats.folders}")
+
+    # 3) Порог не достигнут — поведение как раньше, деление не включается.
+    fake3 = FakeDisk(tree)
+    client3 = DiskClient("token-abcdefghijklmnop", session=fake3.session(), min_request_interval=0)
+    manifest3 = InventoryScanner(client3, root="disk:/", page_size=50,
+                                 split_threshold=100_000).scan()
+    check("без порога — обычный листинг", manifest3.stats.files == 300 and manifest3.is_complete())
+
+    # 4) Страховка: сетевой таймаут на большом каталоге переключает на сплит.
+    class TimeoutOnPlainFake(SplitFake):
+        def session(self):
+            outer = self
+
+            class _S:
+                def request(self, method, url, params=None, headers=None, timeout=None,
+                            allow_redirects=None):
+                    outer.requests += 1
+                    name = (params or {}).get("name") or ""
+                    if not name.startswith("glob:"):
+                        raise NetworkError("connection timeout")
+                    prefix = name[5:].rpartition("/")[2].rstrip("*")
+                    pl = prefix.lower()
+                    page = [i for i in outer.items if str(i["name"]).lower().startswith(pl)]
+                    limit = int((params or {}).get("limit") or 100)
+                    return FakeResponse(200, {
+                        "path": "/Big", "type": "dir", "name": "Big",
+                        "_embedded": {"items": page[:limit], "total": len(outer.items),
+                                      "limit": limit, "offset": 0},
+                    })
+            return _S()
+
+    fake4 = TimeoutOnPlainFake(big)
+    client4 = DiskClient("token-abcdefghijklmnop", session=fake4.session(), min_request_interval=0)
+    scanner4 = InventoryScanner(client4, root="disk:/Big", page_size=50, split_threshold=0)
+    manifest4 = scanner4.scan()
+    check("таймаут обычного листинга лечится сплитом",
+          manifest4.stats.files == 300 and manifest4.is_complete(),
+          f"files={manifest4.stats.files} errors={manifest4.errors}")
+
+    # 5) Защита от немонотонного деления: «вредный» сервер, чей глоб матчает
+    #    только первый символ имени (префикс 'im' даёт тот же каталог, что и
+    #    'i'). Рекурсия по префиксам должна остановиться и докачать сегмент
+    #    страницами, а не уйти в бесконечную глубину/MemoryError.
+    class WeirdGlobFake(SplitFake):
+        def session(self):
+            outer = self
+
+            class _S:
+                def request(self, method, url, params=None, headers=None, timeout=None,
+                            allow_redirects=None):
+                    outer.requests += 1
+                    name = (params or {}).get("name") or ""
+                    if name.startswith("glob:"):
+                        outer.glob_requests += 1
+                        prefix = name[5:].rpartition("/")[2].rstrip("*").lower()
+                        page = [i for i in outer.items
+                                if str(i["name"]).lower()[:len(prefix)] == prefix]
+                    else:
+                        page = list(outer.items)
+                    limit = int((params or {}).get("limit") or 100)
+                    offset = int((params or {}).get("offset") or 0)
+                    return FakeResponse(200, {
+                        "path": "/Big", "type": "dir", "name": "Big",
+                        "_embedded": {"items": page[offset:offset + limit],
+                                      "total": len(page),
+                                      "limit": limit, "offset": offset},
+                    })
+            return _S()
+
+    fake5 = WeirdGlobFake(big)
+    client5 = DiskClient("token-abcdefghijklmnop", session=fake5.session(), min_request_interval=0)
+    _, items5, total5 = split_listing_by_prefix(client5, "disk:/Big", page_size=50)
+    paths5 = [r.api_path for r in items5]
+    check("немонотонный glob не приводит к дублям", len(set(paths5)) == len(paths5),
+          f"{len(paths5)} vs {len(set(paths5))}")
+    check("немонотонный glob находит хотя бы начало алфавита", len(paths5) >= 100,
+          f"{len(paths5)}")
+    check("обход вредного сервера завершается за разумное число запросов",
+          fake5.requests < 3000, f"{fake5.requests}")
 
 
 def test_scan_with_error() -> None:
@@ -647,6 +804,7 @@ def main() -> int:
     for test in (
         test_naming,
         test_pagination_and_scan,
+        test_alphabet_splitting,
         test_scan_with_error,
         test_manifest_atomic,
         test_state_store,
