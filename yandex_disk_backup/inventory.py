@@ -37,6 +37,13 @@ from .manifest import (
 
 log = logging.getLogger(__name__)
 
+# Таймаут чтения при листинге каталогов. Для больших папок (десятки тысяч
+# фотографий) Яндекс формирует ответ дольше обычных 60 с, и запрос обрывался
+# как NetworkError ("connection timeout"). 300 с хватает даже на очень
+# крупные каталоги; значение можно переопределить в конфиге
+# (listing_read_timeout).
+LISTING_READ_TIMEOUT = 300.0
+
 
 @dataclass
 class ScanProgress:
@@ -119,30 +126,40 @@ def list_folder(
     media_type: str = "",
     include_trash: bool = False,
     max_items: int | None = None,
+    read_timeout: float | None = None,
+    on_page: Callable[[int, int], None] | None = None,
 ) -> tuple[Resource, list[Resource], int]:
     """Возвращает (сам ресурс-каталог, элементы, всего элементов по данным API).
 
     Пагинация: offset наращивается, пока страница не станет короче `page_size`
     либо пока offset не достигнет `_embedded.total`.
+
+    `read_timeout` — увеличенный таймаут чтения для больших каталогов
+    (тысячи файлов): Яндекс формирует листинг долго, и при стандартных 60 с
+    запрос обрывается как NetworkError/timeout. Если не задан, используется
+    LISTING_READ_TIMEOUT.
+
+    `on_page(получено_на_странице, всего_страниц_с_начала)` — колбэк, чтобы
+    обход большой папки не выглядел «зависшим»: прогресс обновляется после
+    каждой страницы, а не только после целой папки.
     """
     items: list[Resource] = []
     offset = 0
     total: int | None = None
     folder_meta: dict[str, Any] = {}
+    pages = 0
 
     while True:
-        params: dict[str, Any] = {
-            "path": api_path,
-            "limit": page_size,
-            "offset": offset,
-            "sort": sort,
-        }
-        if media_type:
-            params["media_type"] = media_type
-        if include_trash:
-            params["include_trash"] = "true"
-
-        data = client.get_resource(**params)
+        data = client.list_folder_page(
+            api_path,
+            limit=page_size,
+            offset=offset,
+            sort=sort or None,
+            media_type=media_type or None,
+            include_trash=include_trash,
+            read_timeout=read_timeout if read_timeout is not None else LISTING_READ_TIMEOUT,
+        )
+        pages += 1
         if not folder_meta:
             folder_meta = data
 
@@ -160,6 +177,12 @@ def list_folder(
                 raise ResponseFormatError("элемент листинга — не объект JSON")
             res = Resource.from_api(raw, parent_path=data.get("path") or api_path, depth=0)
             items.append(res)
+
+        if on_page is not None:
+            try:
+                on_page(len(page), pages)
+            except Exception:  # noqa: BLE001 — прогресс не должен ронять обход
+                log.exception("ошибка в колбэке прогресса листинга")
 
         offset += len(page)
         if not page:
@@ -194,6 +217,7 @@ class InventoryScanner:
         max_depth: int | None = None,
         max_files: int | None = None,
         max_folders: int = 200_000,
+        listing_read_timeout: float | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.client = client
@@ -204,19 +228,36 @@ class InventoryScanner:
         self.include_trash = include_trash
         self.max_depth = max_depth
         self.max_files = max_files
+        # Таймаут чтения листинга больших каталогов (см. LISTING_READ_TIMEOUT).
+        self.listing_read_timeout = (
+            LISTING_READ_TIMEOUT if listing_read_timeout is None else float(listing_read_timeout)
+        )
         # Страховка от бесконечного обхода при сбое входных данных:
         # на диске физически не может быть миллион вложенных каталогов.
         self.max_folders = max_folders
         self._should_stop = should_stop or (lambda: False)
 
         self.progress = ScanProgress(current_folder=self.root)
+        #: ISO-время начала обхода — для частичного манифеста.
+        self.progress_started_iso = utc_now_iso()
         self.errors: list[ScanError] = []
         self._visited: set[str] = set()
+        #: Собранные в ходе обхода файлы/папки — доступны и после прерывания,
+        #: чтобы partial-манифест не потерял уже найденное.
+        self._files: list[Resource] = []
+        self._folders: list[Resource] = []
+        #: Обход был прерван пользователем (Ctrl+C / stop-флаг).
+        self.stopped_by_user = False
+        #: Последний колбэк прогресса — вызывается после каждой страницы
+        #: листинга, чтобы большая папка не выглядела «зависшей».
+        self._on_progress: Callable[[ScanProgress], None] | None = None
+        self._last_report_at = 0.0
 
 
 
     # --- основной проход ----------------------------------------------
     def scan(self, on_progress: Callable[[ScanProgress], None] | None = None) -> Manifest:
+        self._on_progress = on_progress
         manifest = Manifest(
             started_at=utc_now_iso(),
             scan_root=self.root,
@@ -224,8 +265,11 @@ class InventoryScanner:
         )
         queue: deque[tuple[Resource, int]] = deque()
         seen_dirs: set[str] = set()
-        files: list[Resource] = []
-        folders: list[Resource] = []
+        # Файлы/папки копятся и в self._files/self._folders — это позволяет
+        # сохранить частичный манифест, если обход прервут (Ctrl+C) или он
+        # упадёт с фатальной ошибки.
+        files = self._files
+        folders = self._folders
 
         root_folder, root_items, _ = self._list_or_fail(self.root, depth=0)
         if root_folder is None:
@@ -244,10 +288,10 @@ class InventoryScanner:
         self._enqueue(root_items, seen_dirs, queue, depth=1)
 
         truncated = False
-        last_report = 0.0
         while queue:
             if self._should_stop():
                 log.info("обход остановлен по запросу пользователя")
+                self.stopped_by_user = True
                 break
             if self.max_files is not None and len(files) >= self.max_files:
                 log.info("достигнут лимит файлов (%s), обход остановлен", self.max_files)
@@ -270,11 +314,7 @@ class InventoryScanner:
                 self._consume(items, files, depth)
                 self._enqueue(items, seen_dirs, queue, depth=depth + 1)
 
-            if on_progress:
-                now = time.monotonic()
-                if now - last_report >= 0.4 or not queue:
-                    on_progress(self.progress)
-                    last_report = now
+            self._report(force=(not queue))
 
         if on_progress:
             on_progress(self.progress)
@@ -292,10 +332,47 @@ class InventoryScanner:
             STATUS_COMPLETE
             if manifest.stats.is_complete
             and not truncated
-            and not self._should_stop()
+            and not self.stopped_by_user
             and not (self.max_files is not None and manifest.stats.files >= self.max_files)
             else STATUS_INCOMPLETE
         )
+        return manifest
+
+    def save_partial(self, data_dir, on_progress_note: Callable[[Manifest], None] | None = None) -> Manifest:
+        """Сохраняет манифест с тем, что успели собрать (после остановки/исключения).
+
+        Используется, когда пользователь прерывает обход (Ctrl+C) или случилась
+        фатальная ошибка: собранные данные не должны пропадать — они пишутся
+        как incomplete-манифест и пригодны для последующей загрузки.
+        """
+        from pathlib import Path as _Path
+
+        from .manifest import manifest_path as _mpath
+
+        manifest = self.build_partial_manifest()
+        path = _mpath(_Path(data_dir))
+        manifest.save(path)
+        log.info("частичный манифест сохранён: %s (%d файлов)", path, manifest.stats.files)
+        if on_progress_note is not None:
+            on_progress_note(manifest)
+        return manifest
+
+    def build_partial_manifest(self) -> Manifest:
+        """Собирает incomplete-манифест из текущего состояния обхода."""
+        files = list(self._files)
+        folders = list(self._folders)
+        manifest = Manifest(
+            started_at=self.progress_started_iso,
+            scan_root=self.root,
+            status=STATUS_INCOMPLETE,
+        )
+        files = sorted(files, key=lambda r: r.path)
+        folders = sorted(folders, key=lambda r: r.path)
+        manifest.files = files
+        manifest.folders = folders
+        manifest.errors.extend(self.errors)
+        manifest.stats = self._stats(files, folders)
+        manifest.finished_at = utc_now_iso()
         return manifest
 
     # --- вспомогательное ----------------------------------------------
@@ -322,6 +399,8 @@ class InventoryScanner:
                 sort=self.sort,
                 media_type=self.media_type,
                 include_trash=self.include_trash,
+                read_timeout=self.listing_read_timeout,
+                on_page=lambda n, p: self._report(force=True),
             )
         except AuthError:
             # Проблема с доступом — дальше идти бессмысленно.
@@ -332,6 +411,15 @@ class InventoryScanner:
             self._record_error(api_path, exc=exc, kind=classify_error(exc))
             return None, [], 0
         return folder, items, total
+
+    def _report(self, force: bool = False) -> None:
+        """Обновляет прогресс; force=True — сразу (после каждой страницы)."""
+        if self._on_progress is None:
+            return
+        now = time.monotonic()
+        if force or now - self._last_report_at >= 0.4:
+            self._on_progress(self.progress)
+            self._last_report_at = now
 
     def _record_error(self, path: str | None, exc: BaseException | None, kind: str,
                       reason: str | None = None) -> None:

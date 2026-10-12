@@ -103,7 +103,13 @@ def run_scan(
     stop: Callable[[], bool] | None = None,
     on_progress: Callable[[ScanProgress], None] | None = None,
 ) -> Manifest:
-    """Этапы C–E + F: обход диска и сохранение манифеста."""
+    """Этапы C–E + F: обход диска и сохранение манифеста.
+
+    Даже если обход прерван (Ctrl+C) или упал с фатальной ошибки, уже
+    собранная часть сохраняется как incomplete-манифест — она не пропадает
+    и пригодна для загрузки; при следующем запуске обход продолжится с нуля
+    и перепишет манифест целиком.
+    """
     client = session.client()
     scanner = InventoryScanner(
         client,
@@ -112,9 +118,22 @@ def run_scan(
         sort=cfg.scan_sort,
         media_type=cfg.media_type,
         include_trash=cfg.include_trash,
+        listing_read_timeout=getattr(cfg, "listing_read_timeout", None),
         should_stop=stop,
     )
-    result = scanner.scan(on_progress=on_progress)
+    try:
+        result = scanner.scan(on_progress=on_progress)
+    except ApiError as exc:
+        # Фатальная ошибка обхода (например, 401) — сохраняем то, что успели.
+        log.error("обход прерван ошибкой API: %s", exc)
+        result = scanner.save_partial(data_dir)
+        result.errors.append(_as_scan_error(scanner, cfg.scan_root, exc))
+        raise
+    except KeyboardInterrupt:
+        log.info("обход прерван пользователем (Ctrl+C)")
+        scanner.stopped_by_user = True
+        scanner.save_partial(data_dir)
+        raise
     result.tool_version = __version__
 
     try:
