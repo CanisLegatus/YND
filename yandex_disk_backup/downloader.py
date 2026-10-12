@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import logging
 import os
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from .api import DiskClient
 from .config import CONFLICT_KEEP, CONFLICT_OVERWRITE, CONFLICT_REPLACE, Config
@@ -158,8 +160,23 @@ def free_space(path: Path) -> int:
 
 
 def _default_http_get(method: str, href: str, **kwargs: Any) -> Any:
-    """Скачивание по временной ссылке. Ответ — контекстный менеджер."""
-    return requests.request(method, href, **kwargs)
+    """Скачивание по временной ссылке. Ответ — контекстный менеджер.
+
+    Собственный Session с pool_maxsize не меньше числа воркеров: без явного
+    размера пула urllib3 держит 10 соединений на хост, и при стриминге
+    (ответы долго не освобождают слот) лишние запросы могли бы ждать
+    освобождения соединения. Вызов всегда идёт внутри `with response:` —
+    соединение возвращается в пул сразу после закрытия ответа.
+    """
+    session = getattr(_default_http_get, "_session", None)
+    if session is None:
+        workers = max(4, int(getattr(threading, "_ydb_download_workers", 4)))
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=workers, pool_maxsize=workers)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _default_http_get._session = session
+    return session.request(method, href, **kwargs)
 
 
 class Downloader:
@@ -189,6 +206,8 @@ class Downloader:
         self._local = threading.local()
         self._stats_lock = threading.Lock()
         self.stats = DownloadStats()
+        # Диагностический счётчик «в очереди» (для heartbeat-лога раз в 10 с).
+        self._pending = 0
         # Глобальный выключатель против 429: общий флаг для всех воркеров.
         if breaker is not None:
             self.breaker = breaker
@@ -238,22 +257,76 @@ class Downloader:
                 outcomes.append(self._handle(record, dry_run))
             return outcomes
 
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ydb-dl") as pool:
-            futures = {pool.submit(self._handle, record, dry_run): record for record in records}
-            for future in as_completed(futures):
-                record = futures[future]
-                try:
-                    outcomes.append(future.result())
-                except ThrottledInterrupt:
-                    # Файл прерван выключателем: не ошибка, вернётся в очередь.
-                    outcomes.append(DownloadOutcome(record.api_path,
-                                                   record.local_path or "", RECHECK,
-                                                   note="прервано выключателем (429)"))
-                except DownloadError as exc:
-                    outcomes.append(self._fail(record, exc))
-                except Exception as exc:  # noqa: BLE001 - не теряем ни одной задачи
-                    log.debug("непредвиденная ошибка при загрузке %s", record.api_path, exc_info=True)
-                    outcomes.append(self._fail(record, DownloadError(human_error(exc), "internal")))
+        # Диагностика «молчаливой остановки»: если поток зависнет (например,
+        # на заблокированном семафоре/замке), через 120 с трейсбек всех потоков
+        # будет выписан в stderr автоматически, без падения процесса.
+        try:
+            faulthandler.dump_traceback_later(120, repeat=True)
+        except (ValueError, OSError):  # например, нет stderr
+            pass
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat() -> None:
+            """Раз в 10 секунд — сводка: байты, файлы, воркеры, очередь."""
+            while not heartbeat_stop.wait(10.0):
+                with self._stats_lock:
+                    done = self.stats.files_done + self.stats.files_skipped
+                    failed = self.stats.files_failed
+                    total = self.stats.files_total
+                    bts = self.stats.bytes_done
+                    note = self.stats.last_note
+                breaker = self.breaker
+                if breaker is not None:
+                    allowed = breaker.allowed_workers
+                    busy, permits = breaker.snapshot()
+                    throttled = "да" if breaker.is_throttled else "нет"
+                    waves = breaker.throttle_waves
+                else:
+                    allowed, throttled, waves = workers, "нет", 0
+                    busy, permits = self._pending and min(self._pending, workers) or 0, 0
+                log.info(
+                    "heartbeat: скачано %s байт, файлов %d/%d (ошибок %d), "
+                    "активных задач %d, в очереди %d, воркеров занято/свободно %d/%d "
+                    "(разрешено %d из %d), троттлинг=%s (волн %d), последний: %s",
+                    bts, done, total, failed, self._pending,
+                    max(0, total - done - failed - self._pending),
+                    busy, permits, allowed, workers, throttled, waves, note,
+                )
+
+        hb = threading.Thread(target=_heartbeat, name="ydb-dl-heartbeat", daemon=True)
+        hb.start()
+        # Размер пула соединений CDN-сессии должен покрывать число воркеров.
+        threading._ydb_download_workers = workers
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ydb-dl") as pool:
+                with self._stats_lock:
+                    self._pending = len(records)
+                futures = {pool.submit(self._handle, record, dry_run): record for record in records}
+                for future in as_completed(futures):
+                    record = futures[future]
+                    with self._stats_lock:
+                        self._pending -= 1
+                    try:
+                        outcomes.append(future.result())
+                    except ThrottledInterrupt:
+                        # Файл прерван выключателем: не ошибка, вернётся в очередь.
+                        outcomes.append(DownloadOutcome(record.api_path,
+                                                       record.local_path or "", RECHECK,
+                                                       note="прервано выключателем (429)"))
+                    except DownloadError as exc:
+                        outcomes.append(self._fail(record, exc))
+                    except Exception as exc:  # noqa: BLE001 - не теряем ни одной задачи
+                        # Логуем полный traceback: проглоченная в пуле ошибка
+                        # иначе выглядит как «процесс просто молчит».
+                        log.error("непредвиденная ошибка при загрузке %s",
+                                  record.api_path, exc_info=True)
+                        outcomes.append(self._fail(record, DownloadError(human_error(exc), "internal")))
+        finally:
+            heartbeat_stop.set()
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except (ValueError, RuntimeError):
+                pass
         if self.breaker is not None and self.breaker.throttle_waves:
             log.info("выключатель срабатывал %d раз(а); финальный параллелизм: %d из %d",
                      self.breaker.throttle_waves, self.breaker.allowed_workers, workers)
@@ -262,6 +335,7 @@ class Downloader:
     # --- один файл -----------------------------------------------------
     def _handle(self, record: FileRecord, dry_run: bool) -> DownloadOutcome:
         started = time.monotonic()
+        log.info("начало загрузки: %s", record.api_path)
         breaker = self.breaker
         if breaker is not None and not dry_run:
             # Динамический параллелизм: воркер занимает «место» семафора.
@@ -270,7 +344,12 @@ class Downloader:
             # больше, чем разрешено выключателем.
             breaker.note_task_start()
         try:
-            return self._handle_inner(record, dry_run, started)
+            outcome = self._handle_inner(record, dry_run, started)
+            log.info("загрузка завершена (%s): %s — статус %s, %s байт, %.1f с",
+                     "пропущен" if outcome.skipped else "ок" if outcome.ok else "ошибка",
+                     record.api_path, outcome.status, outcome.bytes_written,
+                     time.monotonic() - started)
+            return outcome
         finally:
             if breaker is not None and not dry_run:
                 breaker.note_task_end()
@@ -419,10 +498,19 @@ class Downloader:
 
         tmp_headers = {"User-Agent": "YandexDiskBackup/0.3 (read-only backup tool)"}
         tmp_headers.update(headers)
+        # Таймаут скачивания: (соединение, чтение). 10 с на коннект и 60 с без
+        # байт на чтение — «мёртвое» соединение не вешает воркер навсегда,
+        # а ошибка NetworkError превращается в обычную повторную попытку.
+        timeout = self.cfg.download_timeout
+        try:
+            connect_t, read_t = float(timeout[0]), float(timeout[1])
+        except (TypeError, ValueError, IndexError):
+            connect_t, read_t = 10.0, 60.0
+        download_timeout = (min(connect_t, 10.0), min(read_t, 60.0))
 
         try:
             response = self._http_get(
-                method, href, stream=True, timeout=self.cfg.download_timeout,
+                method, href, stream=True, timeout=download_timeout,
                 headers=tmp_headers, allow_redirects=True,
             )
         except requests.RequestException as exc:
