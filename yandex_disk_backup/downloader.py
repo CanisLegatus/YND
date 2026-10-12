@@ -45,10 +45,15 @@ from .state import (
     FileRecord,
     StateStore,
 )
+from .throttle import ThrottleBreaker
 
 log = logging.getLogger(__name__)
 
 PART_SUFFIX = ".part"
+
+
+class ThrottledInterrupt(RuntimeError):
+    """Скачивание прервано глобальным выключателем (429 от любого воркера)."""
 
 
 class DownloadError(RuntimeError):
@@ -170,6 +175,7 @@ class Downloader:
         on_progress: Callable[[DownloadOutcome], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         http_get: Callable[..., Any] | None = None,
+        breaker: ThrottleBreaker | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -183,12 +189,28 @@ class Downloader:
         self._local = threading.local()
         self._stats_lock = threading.Lock()
         self.stats = DownloadStats()
+        # Глобальный выключатель против 429: общий флаг для всех воркеров.
+        if breaker is not None:
+            self.breaker = breaker
+        elif getattr(cfg, "throttle_enabled", True):
+            self.breaker = ThrottleBreaker(
+                max_workers=max(1, int(cfg.concurrency)),
+                base_sleep=getattr(cfg, "throttle_base_sleep", 2.0),
+                max_sleep=getattr(cfg, "throttle_max_sleep", 60.0),
+                recovery_window=getattr(cfg, "throttle_recovery_window", 120.0),
+            )
+        else:
+            self.breaker = None
 
     # --- клиент на поток ----------------------------------------------
     def _client(self) -> DiskClient:
         client = getattr(self._local, "client", None)
         if client is None:
             client = self.client_factory()
+            # Пул воркеров делит один выключатель: 429 любого клиента
+            # усыпляет всех, успех пробника будит всех.
+            if self.breaker is not None and getattr(client, "breaker", None) is None:
+                client.breaker = self.breaker
             self._local.client = client
         return client
 
@@ -222,16 +244,38 @@ class Downloader:
                 record = futures[future]
                 try:
                     outcomes.append(future.result())
+                except ThrottledInterrupt:
+                    # Файл прерван выключателем: не ошибка, вернётся в очередь.
+                    outcomes.append(DownloadOutcome(record.api_path,
+                                                   record.local_path or "", RECHECK,
+                                                   note="прервано выключателем (429)"))
                 except DownloadError as exc:
                     outcomes.append(self._fail(record, exc))
                 except Exception as exc:  # noqa: BLE001 - не теряем ни одной задачи
                     log.debug("непредвиденная ошибка при загрузке %s", record.api_path, exc_info=True)
                     outcomes.append(self._fail(record, DownloadError(human_error(exc), "internal")))
+        if self.breaker is not None and self.breaker.throttle_waves:
+            log.info("выключатель срабатывал %d раз(а); финальный параллелизм: %d из %d",
+                     self.breaker.throttle_waves, self.breaker.allowed_workers, workers)
         return outcomes
 
     # --- один файл -----------------------------------------------------
     def _handle(self, record: FileRecord, dry_run: bool) -> DownloadOutcome:
         started = time.monotonic()
+        breaker = self.breaker
+        if breaker is not None and not dry_run:
+            # Динамический параллелизм: воркер занимает «место» семафора.
+            # После волн 429 мест становится меньше — лишние воркеры ждут,
+            # и одновременных запросов к серверу физически не может быть
+            # больше, чем разрешено выключателем.
+            breaker.note_task_start()
+        try:
+            return self._handle_inner(record, dry_run, started)
+        finally:
+            if breaker is not None and not dry_run:
+                breaker.note_task_end()
+
+    def _handle_inner(self, record: FileRecord, dry_run: bool, started: float) -> DownloadOutcome:
         allocation = self.allocator.allocate(record.api_path, record.path or record.name)
         self.store.bind_local_path(record.api_path, allocation.local_relpath)
         target = allocation.absolute(self.cfg.backup_dir)
@@ -267,6 +311,14 @@ class Downloader:
             if exc.permanent and exc.kind in ("auth", "permission"):
                 raise
             return self._fail(record, exc, allocation=allocation)
+        except ThrottledInterrupt:
+            # Выключатель поднялся посреди передачи: прерываемся немедленно,
+            # но файл НЕ считаем ошибкой — он встанет в очередь заново.
+            self._cleanup(part)
+            self.store.mark(record.api_path, RECHECK)
+            log.info("скачивание %s прервано выключателем (429), будет повтор после сна",
+                     record.name)
+            raise
 
         # Проверка до перемещения — это и есть смысл временного файла.
         problem = self._verify(written, record)
@@ -294,11 +346,34 @@ class Downloader:
         for attempt in range(1, attempts + 1):
             if self._should_stop():
                 raise DownloadError("остановлено пользователем", "stopped", permanent=True)
+            breaker = self.breaker
+            if breaker is not None:
+                # Глобальный выключатель: пока кто-то поймал 429 и флаг поднят,
+                # воркер не начинает новый запрос — коротко спит и проверяет
+                # снова. Это резко обнуляет трафик.
+                breaker.before_request()
             self._cleanup(part)  # каждая попытка начинается с чистого файла
             try:
                 self._download_once(record, part, target, attempt)
+                if breaker is not None:
+                    # Успешная загрузка — признак того, что лимит отпустил.
+                    breaker.on_success()
                 return part
+            except ThrottledInterrupt:
+                # Обрыв посреди передачи из-за выключателя: попытку НЕ расходуем
+                # (файл ни в чём не виноват), даём волне закончиться и пробуем
+                # снова — до throttle_max_attempts дополнительных циклов.
+                extra = getattr(self.cfg, "throttle_max_attempts", 60)
+                self._recovered_after_throttle(extra)
+                continue
             except DownloadError as exc:
+                if breaker is not None and self._is_rate_limit(exc):
+                    # 429 прямого запроса на CDN: поднимаем общий флаг,
+                    # все засыпают; попытка этого файла не расходуется.
+                    breaker.on_throttled(None)
+                    extra = getattr(self.cfg, "throttle_max_attempts", 60)
+                    self._recovered_after_throttle(extra)
+                    continue
                 last = exc
                 if exc.permanent:
                     raise
@@ -313,6 +388,24 @@ class Downloader:
         assert last is not None
         self.store.mark_error(record.api_path, str(last), last.kind)
         raise last
+
+    @staticmethod
+    def _is_rate_limit(exc: DownloadError) -> bool:
+        text = str(exc)
+        return "(429" in text or "HTTP 429" in text or " 429)" in text
+
+    def _recovered_after_throttle(self, max_cycles: int) -> None:
+        """Ждём окончания волны 429: сон короткими интервалами до сброса флага."""
+        breaker = self.breaker
+        assert breaker is not None
+        for _ in range(max(1, int(max_cycles))):
+            if self._should_stop():
+                raise DownloadError("остановлено пользователем", "stopped", permanent=True)
+            if not breaker.is_throttled:
+                return
+            breaker.before_request()
+        # Волна так и не закончилась — прерываем файл, он вернётся в очередь.
+        raise ThrottledInterrupt("выключатель не сбросился за отведённое время")
 
     def _download_once(self, record: FileRecord, part: Path, target: Path, attempt: int) -> None:
         client = self._client()

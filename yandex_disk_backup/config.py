@@ -93,6 +93,11 @@ class Config:
     # --- Скачивание (часть II) ---
     backup_root: str = ""                # "" = default_backup_root()
     concurrency: int = 4                 # одновременных загрузок
+    # --- Глобальный выключатель против 429 (circuit breaker) ---
+    throttle_enabled: bool = True        # включать выключатель при скачивании
+    throttle_base_sleep: float = 2.0     # первый сон волны, с (каждый раз ×2)
+    throttle_max_sleep: float = 60.0     # потолок экспоненциальной паузы, с
+    throttle_recovery_window: float = 120.0  # «спокойных» секунд на +1 воркера
     download_read_timeout: float = 900.0
     # Таймаут чтения при листинге каталогов. Большие папки (десятки тысяч
     # файлов) Яндекс формирует дольше обычных timeout_read=60 с — обход
@@ -182,6 +187,10 @@ class Config:
             "media_type": self.media_type,
             "backup_root": self.backup_root,
             "concurrency": self.concurrency,
+            "throttle_enabled": self.throttle_enabled,
+            "throttle_base_sleep": self.throttle_base_sleep,
+            "throttle_max_sleep": self.throttle_max_sleep,
+            "throttle_recovery_window": self.throttle_recovery_window,
             "download_read_timeout": self.download_read_timeout,
             "listing_read_timeout": self.listing_read_timeout,
             "chunk_size": self.chunk_size,
