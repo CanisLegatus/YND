@@ -217,8 +217,22 @@ class ThrottleBreaker:
     def _reduce_parallelism_locked(self) -> None:
         if self._active_slots > 1:
             new_slots = max(1, self._active_slots // 2)
-            # Отнимаем столько мест, сколько реально свободно прямо сейчас.
+            # Цель — чтобы воркеров, которым разрешено работать (занятые места
+            # плюс свободные), стало не больше new_slots. Отнимаем ровно
+            # reduction свободных мест; если свободных меньше (часть мест
+            # занята воркерами, доделывающими задачи), ничего не отнимаем —
+            # они освободятся сами и следующий воркер упрётся в лимит.
+            # Раньше здесь было `taken = min(reduction, self._permits)`, из-за
+            # чего `_permits` мог уйти в отрицательные значения и
+            # `_permits += 1` в on_success никогда не возвращал его к нулю:
+            # закачка молча вставала намертво после нескольких волн 429.
             reduction = self._active_slots - new_slots
-            taken = min(reduction, self._permits)
+            taken = min(reduction, max(0, self._permits))
             self._permits -= taken
-            self._active_slots -= taken
+            # Разрешённый параллелизм = занятые места + свободные permits.
+            self._active_slots = (self._active_slots - taken) + self._permits
+
+    def snapshot(self) -> tuple[int, int]:
+        """Диагностика: (занятые места, свободные permits)."""
+        with self._lock:
+            return self._active_slots - self._permits, self._permits
