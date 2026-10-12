@@ -68,8 +68,13 @@ class StopFlag:
         return self._event.is_set()
 
 
-def make_client_factory(session: AuthSession, cfg: Config) -> Callable[[], DiskClient]:
-    """Создаёт по клиенту на поток: requests.Session не потокобезопасен."""
+def make_client_factory(session: AuthSession, cfg: Config,
+                        breaker: Any | None = None) -> Callable[[], DiskClient]:
+    """Создаёт по клиенту на поток: requests.Session не потокобезопасен.
+
+    `breaker` — общий ThrottleBreaker: все клиенты пула видят один флаг
+    троттлинга, поэтому 429 любого воркера усыпляет весь пул.
+    """
     token = session.ensure_fresh().access_token
 
     def factory() -> DiskClient:
@@ -80,6 +85,7 @@ def make_client_factory(session: AuthSession, cfg: Config) -> Callable[[], DiskC
             max_retries=cfg.max_retries,
             min_request_interval=cfg.min_request_interval,
             disable_service_logging=cfg.disable_service_logging,
+            breaker=breaker,
         )
 
     return factory

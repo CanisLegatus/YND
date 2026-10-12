@@ -86,6 +86,7 @@ class DiskClient:
         session: requests.Session | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        breaker: Any = None,
     ) -> None:
         if not access_token:
             raise ValueError("access_token обязателен")
@@ -99,6 +100,9 @@ class DiskClient:
         self._session = session or requests.Session()
         self._sleep = sleep
         self._clock = clock
+        #: Глобальный выключатель (ThrottleBreaker) или None. Общий для всех
+        #: клиентов одного пула воркеров: 429 любого воркера усыпляет всех.
+        self.breaker = breaker
         self._last_request_at = 0.0
         #: Счётчик реально выполненных HTTP-запросов (включая повторы).
         #: Нужен, чтобы в манифесте указывать честное число обращений к API.
@@ -215,6 +219,17 @@ class DiskClient:
         last_error: Exception | None = None
 
         for attempt in range(self.max_retries + 1):
+            # Глобальный выключатель: если кто-то уже поймал 429, спим и не
+            # стучимся на сервер. Пробный запрос делает только один воркер —
+            # тот, кому breaker дал роль «пробника».
+            breaker = self.breaker
+            is_probe = False
+            if breaker is not None:
+                while breaker.is_throttled:
+                    if breaker.acquire_probe():
+                        break
+                    breaker.before_request()
+                is_probe = breaker.can_probe() and breaker.is_throttled
             self._throttle()
             try:
                 self._last_request_at = self._clock()
@@ -243,12 +258,44 @@ class DiskClient:
 
             status = response.status_code
             if status in (200, 201, 202, 203, 204):
+                if breaker is not None:
+                    # Успех (в том числе пробный запрос после бури) — снимаем
+                    # общий флаг, все воркеры просыпаются и продолжают качать.
+                    breaker.on_success()
+                    breaker.release_probe()
                 return self._parse_json(response)
 
+            if status == 429:
+                # Кто бы ни получил 429 — выключатель срабатывает глобально:
+                # флаг поднят, остальные засыпают, параллелизм снижается.
+                retry_after = self._retry_after(response)
+                if breaker is not None:
+                    if is_probe:
+                        # Пробный запрос не удался: wave продлевается с
+                        # удвоением; право пробника освободит on_throttled.
+                        breaker.on_throttled(retry_after)
+                    else:
+                        # Обычный воркер поймал 429 «вслепую»: сигналим всем,
+                        # но сами остаёмся в цикле повторов этого файла.
+                        was_throttled = breaker.is_throttled
+                        breaker.on_throttled(retry_after)
+                        if was_throttled:
+                            breaker.acquire_probe()
+                else:
+                    self._sleep(min(300.0, max(1.0, retry_after or 2.0)))
+                last_error = self._transient(response)
+                if attempt >= self.max_retries:
+                    break
+                continue
+
             if status in (401, 403, 404, 423):
+                if breaker is not None:
+                    breaker.release_probe()
                 raise self._fatal(response)
 
-            if status == 429 or status in (500, 502, 503, 504, 408, 425):
+            if status in (500, 502, 503, 504, 408, 425):
+                if breaker is not None:
+                    breaker.release_probe()
                 last_error = self._transient(response)
                 if attempt >= self.max_retries:
                     break
@@ -260,9 +307,13 @@ class DiskClient:
                 self._sleep(delay)
                 continue
 
+            if breaker is not None:
+                breaker.release_probe()
             raise self._fatal(response)
 
         assert last_error is not None
+        if breaker is not None:
+            breaker.release_probe()
         raise last_error
 
     # --- разбор ответов ----------------------------------------------
