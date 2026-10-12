@@ -22,6 +22,7 @@ from .session import AuthRequired, AuthSession
 from .state import StateStore
 from .token_store import TokenStore
 from .workflow import (
+    StopFlag,
     run_download,
     run_full,
     run_report,
@@ -214,11 +215,34 @@ class ConsoleApp:
     def action_scan(self) -> None:
         self._require_config()
         print(f"\n  Обход диска с корня {self.cfg.scan_root}…")
-        print("  Ctrl+C — мягкая остановка, прогресс сохранится.\n")
-        manifest = run_scan(
-            self.cfg, self.session, self.data_dir,
-            on_progress=_scan_line(),
-        )
+        print("  Ctrl+C — мягкая остановка, уже собранное сохранится в манифест.")
+        print(f"  Пагинация: по {self.cfg.page_size} элементов; таймаут больших"
+              f" каталогов: {int(getattr(self.cfg, 'listing_read_timeout', 300))} с.\n")
+        stop = StopFlag()
+        stop.install()
+        try:
+            manifest = run_scan(
+                self.cfg, self.session, self.data_dir,
+                stop=stop, on_progress=_scan_line(),
+            )
+        except KeyboardInterrupt:
+            print("\n  ⏹ Обход прерван. Уже найденное сохранено как неполный манифест.")
+            stored = manifest_path(self.data_dir)
+            if stored.exists():
+                try:
+                    m = Manifest.load(stored)
+                    print(f"    Файлов собрано: {_num(m.stats.files)}, "
+                          f"папок: {_num(m.stats.folders)}")
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        except ApiError as exc:
+            print(f"\n  ✗ Обход прерван ошибкой API: {exc}")
+            print("  Частичный манифест сохранён (статус incomplete)." if
+                  manifest_path(self.data_dir).exists() else "")
+            return
+        finally:
+            stop.restore()
         print()
         _print_scan_summary(manifest)
         print(f"\n  Манифест сохранён: {manifest_path(self.data_dir)}")

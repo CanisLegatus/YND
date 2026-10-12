@@ -116,6 +116,38 @@ class DiskClient:
         params["path"] = path
         return self._request("GET", "/disk/resources", params=params)
 
+    def list_folder_page(
+        self,
+        path: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        sort: str | None = None,
+        media_type: str | None = None,
+        include_trash: bool = False,
+        read_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Одна страница листинга папки (GET /v1/disk/resources).
+
+        `read_timeout` — увеличенный таймаут чтения: для больших каталогов
+        (тысячи фотографий) Яндекс формирует ответ заметно дольше обычных 60 с,
+        и при стандартном таймауте запрос обрывается с ConnectTimeout/
+        ReadTimeout. Здесь он поднимается по умолчанию до 300 с.
+        """
+        params: dict[str, Any] = {"path": path, "limit": max(1, int(limit))}
+        if offset > 0:
+            params["offset"] = offset
+        if sort:
+            params["sort"] = sort
+        if media_type:
+            params["media_type"] = media_type
+        if include_trash:
+            params["include_trash"] = "true"
+        timeout = self.timeout
+        if read_timeout is not None:
+            timeout = (timeout[0], float(read_timeout))
+        return self._request("GET", "/disk/resources", params=params, timeout=timeout)
+
     def get_download_link(self, path: str) -> tuple[str, str]:
         """GET /v1/disk/resources/download — временная ссылка на скачивание.
 
@@ -154,8 +186,11 @@ class DiskClient:
         method: str,
         path: str,
         params: dict[str, Any] | None = None,
+        timeout: tuple[float, float] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
+        if timeout is None:
+            timeout = self.timeout
         last_error: Exception | None = None
 
         for attempt in range(self.max_retries + 1):
@@ -168,7 +203,7 @@ class DiskClient:
                     url,
                     params=params,
                     headers=self._headers(),
-                    timeout=self.timeout,
+                    timeout=timeout,
                     allow_redirects=False,
                 )
             except requests.exceptions.RequestException as exc:
@@ -186,7 +221,7 @@ class DiskClient:
                 continue
 
             status = response.status_code
-            if status == 200:
+            if status in (200, 201, 202, 203, 204):
                 return self._parse_json(response)
 
             if status in (401, 403, 404, 423):

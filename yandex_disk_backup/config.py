@@ -95,6 +95,10 @@ class Config:
     backup_root: str = ""                # "" = default_backup_root()
     concurrency: int = 4                 # одновременных загрузок
     download_read_timeout: float = 900.0
+    # Таймаут чтения при листинге каталогов. Большие папки (десятки тысяч
+    # файлов) Яндекс формирует дольше обычных timeout_read=60 с — обход
+    # обрывался с "connection timeout". Для таких каталогов нужен запас.
+    listing_read_timeout: float = 300.0
     chunk_size: int = FILE_CHUNK_SIZE
     max_attempts_per_file: int = 3
     preserve_times: bool = True          # выставлять mtime из поля modified
@@ -181,6 +185,7 @@ class Config:
             "backup_root": self.backup_root,
             "concurrency": self.concurrency,
             "download_read_timeout": self.download_read_timeout,
+            "listing_read_timeout": self.listing_read_timeout,
             "chunk_size": self.chunk_size,
             "max_attempts_per_file": self.max_attempts_per_file,
             "preserve_times": self.preserve_times,
