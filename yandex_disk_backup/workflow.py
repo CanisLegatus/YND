@@ -115,7 +115,6 @@ def run_scan(
         client,
         root=cfg.scan_root,
         page_size=cfg.page_size,
-        sort=cfg.scan_sort,
         media_type=cfg.media_type,
         include_trash=cfg.include_trash,
         listing_read_timeout=getattr(cfg, "listing_read_timeout", None),

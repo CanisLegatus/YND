@@ -86,8 +86,7 @@ class Config:
 
     # --- Обход (этапы D/E) ---
     scan_root: str = "disk:/"            # с чего начинаем обход
-    page_size: int = 200                 # параметр limit в /v1/disk/resources
-    scan_sort: str = "path"              # поле сортировки листинга
+    page_size: int = 500                 # параметр limit в /v1/disk/resources
     include_trash: bool = False          # включать ли корзину
     media_type: str = ""                 # например "image" или "video"; "" = все
 
@@ -179,7 +178,6 @@ class Config:
             "max_retries": self.max_retries,
             "scan_root": self.scan_root,
             "page_size": self.page_size,
-            "scan_sort": self.scan_sort,
             "include_trash": self.include_trash,
             "media_type": self.media_type,
             "backup_root": self.backup_root,

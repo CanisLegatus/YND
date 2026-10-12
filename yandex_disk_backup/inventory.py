@@ -288,17 +288,21 @@ def list_folder(
             break
         if total is not None and offset >= total:
             break
+        # Стоп-флаг/лимит файлов проверяем ДО добора хвоста и до ветки
+        # max_items: обрыв посреди гигантской папки должен сохранить offset
+        # в базе, а не дочитывать её целиком «на автопилоте».
+        stop_now = should_stop is not None and should_stop()
+        if stop_now and max_items is None:
+            break
         if max_items is not None and listed >= max_items:
             # Дочитали контрольный объём (или лимит файлов сканера): выходим,
             # сохранив offset — при возобновлении продолжим отсюда. Если это
             # был именно стоп-флаг (listed > max_items), добираем хвост
             # последней страницы, чтобы ни один элемент не потерялся.
-            if overflow := listed - max_items:
+            if stop_now and (overflow := listed - max_items):
                 items.extend(_overflow_tail(client, api_path, overflow,
                                             page_size, offset, rt, media_type,
                                             include_trash))
-            break
-        if should_stop is not None and should_stop():
             break
 
     folder = Resource.from_api(folder_meta, depth=0) if folder_meta else Resource(
@@ -379,6 +383,15 @@ class InventoryScanner:
         self._on_progress: Callable[[ScanProgress], None] | None = None
         self._last_report_at = 0.0
         self._queue: deque[FolderRow] = deque()
+
+    def _listing_should_stop(self) -> bool:
+        """Стоп-условие для проверки прямо внутри листинга папки:
+        флаг пользователя или достигнутый лимит файлов сканера."""
+        if self._should_stop():
+            return True
+        if self.max_files is not None and len(self._files) >= self.max_files:
+            return True
+        return False
 
     # --- основной проход ----------------------------------------------
     def scan(self, on_progress: Callable[[ScanProgress], None] | None = None) -> Manifest:
@@ -589,6 +602,17 @@ class InventoryScanner:
         if self._should_stop():
             # Прервано пользователем: offset уже сохранён постранично —
             # папка осталась в статусе listing и продолжится при следующем запуске.
+            return
+
+        listed_all = (self.store.get_folder(api_path) if self.store is not None else None)
+        stopped_midway = (
+            self.max_files is not None and len(self._files) >= self.max_files
+            and listed_all is not None and listed_all.status != STATUS_DONE
+            and listed_all.total is not None and listed_all.offset < listed_all.total
+        )
+        if stopped_midway:
+            # Достигнут лимит файлов посреди большой папки: она остаётся
+            # недочитанной (offset сохранён), возобновление продолжит с него.
             return
 
         self.progress.folders_done += 1
