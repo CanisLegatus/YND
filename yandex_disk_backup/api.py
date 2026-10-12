@@ -71,13 +71,16 @@ class ResponseFormatError(ApiError):
 class DiskClient:
     """Тонкая обёртка над REST API Яндекс Диска. Только чтение."""
 
+    #: Таймауты по умолчанию: 10 с на установку соединения, 60 с на чтение.
+    DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)
+
     def __init__(
         self,
         access_token: str,
         *,
         base_url: str = "https://cloud-api.yandex.net/v1",
-        timeout: tuple[float, float] = (15.0, 60.0),
-        max_retries: int = 5,
+        timeout: tuple[float, float] | None = None,
+        max_retries: int = 6,
         min_request_interval: float = 0.25,
         disable_service_logging: bool = True,
         session: requests.Session | None = None,
@@ -89,7 +92,7 @@ class DiskClient:
         SECRETS.add(access_token)
         self._token = access_token
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = tuple(self.DEFAULT_TIMEOUT if timeout is None else timeout)
         self.max_retries = max(0, int(max_retries))
         self.min_request_interval = max(0.0, float(min_request_interval))
         self.disable_service_logging = disable_service_logging
@@ -116,40 +119,51 @@ class DiskClient:
         params["path"] = path
         return self._request("GET", "/disk/resources", params=params)
 
+    #: Размер страницы листинга: обход всегда идёт страницами по 500 элементов.
+    LISTING_PAGE_LIMIT = 500
+
+    #: Обязательный параметр `fields` для листинга. Без него ответ раздувается
+    #: превью-ссылками и прочими полями, которые обходу не нужны, — на больших
+    #: каталогах это многократная лишняя переписка с API.
+    LISTING_FIELDS = ",".join(
+        (
+            "_embedded.total",
+            "_embedded.items.name",
+            "_embedded.items.path",
+            "_embedded.items.type",
+            "_embedded.items.size",
+            "_embedded.items.md5",
+            "_embedded.items.modified",
+        )
+    )
+
     def list_folder_page(
         self,
         path: str,
         *,
-        limit: int,
         offset: int = 0,
-        sort: str | None = None,
-        media_type: str | None = None,
-        include_trash: bool = False,
+        limit: int = LISTING_PAGE_LIMIT,
         read_timeout: float | None = None,
-        extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Одна страница листинга папки (GET /v1/disk/resources).
+        """Одна страница листинга папки: GET /v1/disk/resources.
 
-        `read_timeout` — увеличенный таймаут чтения: для больших каталогов
-        (тысячи фотографий) Яндекс формирует ответ заметно дольше обычных 60 с,
-        и при стандартном таймауте запрос обрывается с ConnectTimeout/
-        ReadTimeout. Здесь он поднимается по умолчанию до 300 с.
+        Формирует строго фиксированный набор параметров: `path`, `limit=500`,
+        `offset` и обязательный `fields` (без него ответ раздувается
+        превью-ссылками). Параметр `sort` намеренно НЕ используется, как и
+        любые фильтры по имени: API не поддерживает разбиение выборки по
+        префиксам имён, и такие запросы лишь умножают нагрузку на сервер.
 
-        `extra_params` — дополнительные параметры запроса; используются
-        стратегией «alphabet-splitting» (см. inventory.split_listing_by_prefix)
-        для фильтров вида `name=glob:<папка>/<префикс>*`.
+        `read_timeout` — увеличенный таймаут чтения для гигантских каталогов
+        (десятки тысяч файлов): Яндекс формирует страницу таких папок дольше
+        обычных 60 с, и без запаса запрос обрывался как NetworkError.
         """
-        params: dict[str, Any] = {"path": path, "limit": max(1, int(limit))}
+        params: dict[str, Any] = {
+            "path": path,
+            "limit": max(1, int(limit)),
+            "fields": self.LISTING_FIELDS,
+        }
         if offset > 0:
             params["offset"] = offset
-        if sort:
-            params["sort"] = sort
-        if media_type:
-            params["media_type"] = media_type
-        if include_trash:
-            params["include_trash"] = "true"
-        if extra_params:
-            params.update(extra_params)
         timeout = self.timeout
         if read_timeout is not None:
             timeout = (timeout[0], float(read_timeout))
